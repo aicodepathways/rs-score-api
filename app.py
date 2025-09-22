@@ -16,10 +16,14 @@ def fetch(symbol: str, period: str = "6mo") -> pd.DataFrame:
     return df
 
 def rs_rank(df_sym: pd.DataFrame, df_spx: pd.DataFrame, length: int) -> float | None:
-    # SAFE with new pandas: build a DataFrame explicitly instead of Series.rename()
-    s1 = df_sym["Adj Close"]
-    s2 = df_spx["Adj Close"]
-    df = pd.DataFrame({"sym": s1, "spx": s2}).dropna()
+    # Get Adj Close series and give them explicit names
+    s1 = df_sym["Adj Close"].copy()
+    s1.name = "sym"
+    s2 = df_spx["Adj Close"].copy()
+    s2.name = "spx"
+
+    # Combine into one DataFrame, aligned by date
+    df = pd.concat([s1, s2], axis=1).dropna()
 
     if len(df) < length:
         return None
