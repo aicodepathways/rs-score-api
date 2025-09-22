@@ -16,22 +16,28 @@ def fetch(symbol: str, period: str = "6mo") -> pd.DataFrame:
     return df
 
 def rs_rank(df_sym: pd.DataFrame, df_spx: pd.DataFrame, length: int) -> float | None:
-    s1 = df_sym["Adj Close"].rename("sym")
-    s2 = df_spx["Adj Close"].rename("spx")
-    df = pd.concat([s1, s2], axis=1).dropna()
+    # SAFE with new pandas: build a DataFrame explicitly instead of Series.rename()
+    s1 = df_sym["Adj Close"]
+    s2 = df_spx["Adj Close"]
+    df = pd.DataFrame({"sym": s1, "spx": s2}).dropna()
+
     if len(df) < length:
         return None
-    rs = (df["sym"] / df["spx"]).tail(length)
+
+    # Compute RS over the last `length` daily bars
+    window = df.tail(length)
+    rs = window["sym"] / window["spx"]
     lo, hi = rs.min(), rs.max()
     if math.isclose(hi - lo, 0.0):
-        return 50.0
-    return round((rs.iloc[-1] - lo) / (hi - lo) * 100.0, 1)
+        return 50.0  # neutral if flat
+    latest = rs.iloc[-1]
+    return round((latest - lo) / (hi - lo) * 100.0, 1)
 
 def normalize(payload: Any) -> List[str]:
     # Accepts {"tickers":[...]}, or [{"Ticker":[...]}], or ["AAPL","MSFT"]
     if isinstance(payload, dict) and "tickers" in payload:
         seq = payload["tickers"]
-    elif isinstance(payload, list) and len(payload)==1 and isinstance(payload[0], dict) and "Ticker" in payload[0]:
+    elif isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], dict) and "Ticker" in payload[0]:
         seq = payload[0]["Ticker"]
     elif isinstance(payload, list):
         seq = payload
