@@ -37,6 +37,7 @@ def rs_rank(df_sym: pd.DataFrame, df_spx: pd.DataFrame, length: int) -> float | 
 
 
 def normalize(payload: Any) -> List[str]:
+    # Accepts {"tickers":[...]}, or [{"Ticker":[...]}], or ["AAPL","MSFT"]
     if isinstance(payload, dict) and "tickers" in payload:
         seq = payload["tickers"]
     elif isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], dict) and "Ticker" in payload[0]:
@@ -89,40 +90,38 @@ def enrich_endpoint(payload: Any = Body(...)) -> Dict[str, Any]:
     results = []
     for sym in tickers:
         try:
-            # Daily data for gap
+            # ----- Gap: yesterday's close vs today's open (daily data)
             df_daily = fetch(sym, period="1mo", interval="1d")
             if len(df_daily) < 2:
                 raise HTTPException(status_code=502, detail=f"Not enough daily data for {sym}")
-            yesterday_close = df_daily["Close"].iloc[-2]
-            today_open = df_daily["Open"].iloc[-1]
-            gap_pct = round((today_open - yesterday_close) / yesterday_close * 100, 2)
+            yesterday_close = float(df_daily["Close"].iloc[-2])
+            today_open = float(df_daily["Open"].iloc[-1])
+            gap_pct = round((today_open - yesterday_close) / yesterday_close * 100.0, 2)
             gap_up = today_open > yesterday_close
 
-            # Intraday data for volume (15m candles)
+            # ----- First 15m volume today vs 10-day avg (15m intraday)
             df_intraday = fetch(sym, period="11d", interval="15m")
             if df_intraday.empty:
                 raise HTTPException(status_code=502, detail=f"No intraday data for {sym}")
 
-            # Group by day
+            # First 15m bar per session as scalars
             df_intraday["date"] = df_intraday.index.date
-            grouped = df_intraday.groupby("date")
+            daily_first = df_intraday.groupby("date")["Volume"].first()
 
-            vols = []
-            for _, g in grouped:
-                vols.append(g["Volume"].iloc[0])  # first 15m bar of the day
-
-            if len(vols) < 2:
+            if len(daily_first) < 2:
                 raise HTTPException(status_code=502, detail=f"Not enough intraday history for {sym}")
 
-            vol_today = vols[-1]
-            vol_avg10 = round(sum(vols[:-1][-10:]) / min(10, len(vols) - 1), 0)
+            vol_today = int(daily_first.iloc[-1])
+            # average of prior up to 10 sessions’ first-15m volume
+            prior = daily_first.iloc[:-1].tail(10)
+            vol_avg10 = int(round(float(prior.mean()))) if len(prior) > 0 else 0
 
             results.append({
                 "ticker": sym,
                 "gap_percent": gap_pct,
                 "gap_up": gap_up,
-                "vol_15m_today": int(vol_today),
-                "vol_15m_avg10": int(vol_avg10),
+                "vol_15m_today": vol_today,
+                "vol_15m_avg10": vol_avg10,
             })
         except HTTPException as e:
             results.append({"ticker": sym, "error": e.detail})
