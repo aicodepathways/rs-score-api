@@ -16,19 +16,17 @@ def fetch(symbol: str, period: str = "6mo") -> pd.DataFrame:
     return df
 
 def rs_rank(df_sym: pd.DataFrame, df_spx: pd.DataFrame, length: int) -> float | None:
-    # Get Adj Close series and give them explicit names
+    # Get Adj Close as Series
     s1 = df_sym["Adj Close"].copy()
-    s1.name = "sym"
     s2 = df_spx["Adj Close"].copy()
-    s2.name = "spx"
 
-    # Combine into one DataFrame, aligned by date
+    # Align and FORCE column names
     df = pd.concat([s1, s2], axis=1).dropna()
+    df.columns = ["sym", "spx"]  # ensure we have these names
 
     if len(df) < length:
         return None
 
-    # Compute RS over the last `length` daily bars
     window = df.tail(length)
     rs = window["sym"] / window["spx"]
     lo, hi = rs.min(), rs.max()
