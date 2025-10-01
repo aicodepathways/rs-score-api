@@ -127,3 +127,57 @@ def enrich_endpoint(payload: Any = Body(...)) -> Dict[str, Any]:
             results.append({"ticker": sym, "error": e.detail})
 
     return {"results": results}
+
+
+@app.post("/enrich_bear")
+def enrich_bear_endpoint(payload: Any = Body(...)) -> Dict[str, Any]:
+    """
+    Bear-case enrichment:
+    - Gap % (today's open vs yesterday's close), plus a boolean `gap_down`
+    - First 15m volume vs average first-15m volume over last 10 trading days
+    """
+    tickers = normalize(payload)
+    if not tickers:
+        raise HTTPException(status_code=400, detail="Empty tickers list.")
+
+    results = []
+    for sym in tickers:
+        try:
+            # ----- Gap: yesterday's close vs today's open (daily data)
+            df_daily = fetch(sym, period="1mo", interval="1d")
+            if len(df_daily) < 2:
+                raise HTTPException(status_code=502, detail=f"Not enough daily data for {sym}")
+            yesterday_close = float(df_daily["Close"].iloc[-2])
+            today_open = float(df_daily["Open"].iloc[-1])
+            gap_pct = round((today_open - yesterday_close) / yesterday_close * 100.0, 2)
+            gap_down = today_open < yesterday_close
+
+            # (Optional) force negative sign for down gaps:
+            # if gap_down and gap_pct > 0:
+            #     gap_pct = -gap_pct
+
+            # ----- First 15m volume today vs 10-day avg (15m intraday)
+            df_intraday = fetch(sym, period="11d", interval="15m")
+            if df_intraday.empty:
+                raise HTTPException(status_code=502, detail=f"No intraday data for {sym}")
+
+            df_intraday["date"] = df_intraday.index.date
+            daily_first = df_intraday.groupby("date")["Volume"].first()
+            if len(daily_first) < 2:
+                raise HTTPException(status_code=502, detail=f"Not enough intraday history for {sym}")
+
+            vol_today = int(daily_first.iloc[-1])
+            prior = daily_first.iloc[:-1].tail(10)
+            vol_avg10 = int(round(float(prior.mean()))) if len(prior) > 0 else 0
+
+            results.append({
+                "ticker": sym,
+                "gap_percent": gap_pct,
+                "gap_down": gap_down,
+                "vol_15m_today": vol_today,
+                "vol_15m_avg10": vol_avg10,
+            })
+        except HTTPException as e:
+            results.append({"ticker": sym, "error": e.detail})
+
+    return {"results": results}
