@@ -7,10 +7,10 @@ import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI, Body, HTTPException
 
-# --- NEW: imports for the first-15m endpoint ---
+# --- NEW: imports for the first-15m/15m checks endpoints ---
 from datetime import time as dtime
 import pytz
-# ----------------------------------------------
+# -----------------------------------------------------------
 
 app = FastAPI(title="RS5/RS10 API")
 
@@ -22,9 +22,9 @@ FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN", "")
 _ext_cache: dict[str, Tuple[float, Tuple[float | None, float | None]]] = {}
 EXT_TTL = 60 * 30  # 30 minutes cache
 
-# --- NEW: timezone for RTH filtering in first-15m endpoint ---
+# --- Timezone for RTH filtering ---
 NY_TZ = pytz.timezone("America/New_York")
-# ------------------------------------------------------------
+# ----------------------------------
 
 
 def fetch(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
@@ -313,7 +313,91 @@ def enrich_ext_endpoint(payload: Any = Body(...)) -> Dict[str, Any]:
     return {"results": results}
 
 
-# -------------------- NEW: first 15-minute volume spikes --------------------
+# -------------------- Helpers for 15m RTH analytics --------------------
+
+def rth_15m_df(sym: str, days: int = 20) -> pd.DataFrame:
+    """
+    Fetch ~N trading days of 15m bars, convert to America/New_York, and filter to RTH (09:30–16:00).
+    """
+    df = fetch(sym, period=f"{days}d", interval="15m")
+    if df.empty:
+        raise HTTPException(status_code=502, detail=f"No intraday data for {sym}")
+
+    # tz-aware and ET, cash session only
+    if df.index.tz is None:
+        df = df.tz_localize("UTC")
+    df = df.tz_convert(NY_TZ)
+    df = df.between_time(dtime(9, 30), dtime(16, 0)).copy()
+    df["session"] = df.index.date
+    return df
+
+
+def prev_vs_26(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Uses the most recent completed RTH bar in df. Compares its volume vs 26 bars ago.
+    """
+    if len(df) < 27:
+        raise HTTPException(status_code=502, detail="Not enough 15m RTH bars")
+    prev_bar_time = df.index[-1]
+    prev_bar_vol = int(df["Volume"].iloc[-1])
+    vol_26ago = int(df["Volume"].iloc[-27])
+    ratio_26 = (prev_bar_vol / vol_26ago) if vol_26ago > 0 else float("inf")
+    return {
+        "prev_bar_time_et": prev_bar_time.strftime("%Y-%m-%d %H:%M"),
+        "prev_bar_vol": prev_bar_vol,
+        "vol_26bars_ago": vol_26ago,
+        "ratio_prev_vs_26ago": None if math.isinf(ratio_26) else round(ratio_26, 2),
+    }
+
+
+def first15_stats(df: pd.DataFrame, session_key) -> Dict[str, Any]:
+    grp = df.groupby("session")["Volume"]
+    daily_first = grp.first()
+    first15_today = int(daily_first.loc[session_key])
+    prev_days_first = daily_first.drop(index=session_key) if session_key in daily_first.index else daily_first
+    first15_avg10 = int(round(float(prev_days_first.tail(10).mean()))) if len(prev_days_first) else 0
+    first15_prevday = int(prev_days_first.iloc[-1]) if len(prev_days_first) >= 1 else 0
+    ratio_avg10 = (first15_today / first15_avg10) if first15_avg10 > 0 else float("inf")
+    ratio_prevday = (first15_today / first15_prevday) if first15_prevday > 0 else float("inf")
+    return {
+        "today": first15_today,
+        "avg10": first15_avg10,
+        "ratio_vs_avg10": None if math.isinf(ratio_avg10) else round(ratio_avg10, 2),
+        "prevday": first15_prevday,
+        "ratio_vs_prevday": None if math.isinf(ratio_prevday) else round(ratio_prevday, 2),
+    }
+
+
+def last15_stats(df: pd.DataFrame, session_key) -> Dict[str, Any]:
+    grp = df.groupby("session")["Volume"]
+    daily_last = grp.last()
+
+    # determine if today's close bar exists (we keep the original >=16:00 check)
+    rows_today = df.loc[df["session"] == session_key]
+    has_today_close_bar = False
+    today_val = None
+    if len(rows_today) > 0 and rows_today.index[-1].time() >= dtime(16, 0):
+        has_today_close_bar = True
+        today_val = int(daily_last.loc[session_key])
+
+    prev_days_last = daily_last.drop(index=session_key) if session_key in daily_last.index else daily_last
+    avg10 = int(round(float(prev_days_last.tail(10).mean()))) if len(prev_days_last) else 0
+    prevday = int(prev_days_last.iloc[-1]) if len(prev_days_last) >= 1 else 0
+
+    ratio_avg10 = (today_val / avg10) if (has_today_close_bar and avg10 > 0) else float("inf")
+    ratio_prevday = (today_val / prevday) if (has_today_close_bar and prevday > 0) else float("inf")
+
+    return {
+        "has_today_close_bar": has_today_close_bar,
+        "today": today_val if has_today_close_bar else None,
+        "avg10": avg10 if has_today_close_bar else None,
+        "ratio_vs_avg10": None if (not has_today_close_bar or math.isinf(ratio_avg10)) else round(ratio_avg10, 2),
+        "prevday": prevday if has_today_close_bar else None,
+        "ratio_vs_prevday": None if (not has_today_close_bar or math.isinf(ratio_prevday)) else round(ratio_prevday, 2),
+    }
+
+
+# -------------------- Existing first-15 spike screen (9:47 ET) --------------------
 
 def first_15m_volumes(sym: str) -> Tuple[int, int, float]:
     """
@@ -379,156 +463,102 @@ def first15_spikes_endpoint(
     return {"multiple": multiple, "spikes": spikes, "results": results}
 
 
-# -------------------- NEW: 15m checks at 9:50 AM & 4:05 PM (RTH only) --------------------
+# -------------------- NEW: Split 15m endpoints --------------------
 
-def rth_15m_df(sym: str, days: int = 16) -> pd.DataFrame:
-    """
-    Fetch ~N trading days of 15m bars, convert to America/New_York, and filter to RTH (09:30–16:00).
-    """
-    df = fetch(sym, period=f"{days}d", interval="15m")
-    if df.empty:
-        raise HTTPException(status_code=502, detail=f"No intraday data for {sym}")
-
-    # Make tz-aware and convert to ET, then keep cash session only
-    if df.index.tz is None:
-        df = df.tz_localize("UTC")
-    df = df.tz_convert(NY_TZ)
-    df = df.between_time(dtime(9, 30), dtime(16, 0)).copy()
-    df["session"] = df.index.date
-    return df
-
-
-def compute_15m_checks(sym: str) -> Dict[str, Any]:
-    """
-    For the most recent completed RTH bar:
-      - Compare its volume to the bar 26 bars ago (≈ same bar previous RTH day).
-      - Compute first 15m and last 15m volume stats: today's vs 10-day avg and vs previous day.
-    """
-    df = rth_15m_df(sym, days=20)
-    if len(df) < 27:
-        raise HTTPException(status_code=502, detail=f"Not enough 15m RTH bars for {sym}")
-
-    # Previous completed bar (as of call time)
-    prev_bar_time = df.index[-1]
-    prev_bar_vol = int(df["Volume"].iloc[-1])
-
-    # 26 bars ago (≈ prior RTH day same slot)
-    vol_26ago = None
-    ratio_26 = None
-    gt_2x_26 = None
-    lt_0_5x_26 = None
-    if len(df) >= 27:
-        vol_26ago = int(df["Volume"].iloc[-27])
-        ratio_26 = (prev_bar_vol / vol_26ago) if vol_26ago > 0 else float("inf")
-        gt_2x_26 = (ratio_26 >= 2.0) if not math.isinf(ratio_26) else (vol_26ago == 0 and prev_bar_vol > 0)
-        lt_0_5x_26 = (ratio_26 <= 0.5) if not math.isinf(ratio_26) else False
-
-    # First & last bar per session
-    grp = df.groupby("session")["Volume"]
-    daily_first = grp.first()
-    daily_last = grp.last()
-
-    # Identify today's session key (same as prev_bar session)
-    today_key = prev_bar_time.date()
-
-    # --- First 15m stats ---
-    first15_today = int(daily_first.loc[today_key])
-    prev_days_first = daily_first.drop(index=today_key) if today_key in daily_first.index else daily_first
-    first15_avg10 = int(round(float(prev_days_first.tail(10).mean()))) if len(prev_days_first) else 0
-    first15_prevday = int(prev_days_first.iloc[-1]) if len(prev_days_first) >= 1 else 0
-    first15_ratio_avg10 = (first15_today / first15_avg10) if first15_avg10 > 0 else float("inf")
-    first15_ratio_prevday = (first15_today / first15_prevday) if first15_prevday > 0 else float("inf")
-
-    # --- Last 15m stats (only valid if today's last bar exists i.e., 15:45–16:00 closed) ---
-    last_rows_today = df.loc[df["session"] == today_key]
-    has_last_today = False
-    last15_today = None
-    last15_avg10 = None
-    last15_prevday = None
-    last15_ratio_avg10 = None
-    last15_ratio_prevday = None
-
-    if len(last_rows_today) > 0:
-        # Last RTH bar timestamps at 16:00
-        last_time_today = last_rows_today.index[-1].time()
-        if last_time_today >= dtime(16, 0):
-            has_last_today = True
-            last15_today = int(daily_last.loc[today_key])
-            prev_days_last = daily_last.drop(index=today_key) if today_key in daily_last.index else daily_last
-            last15_avg10 = int(round(float(prev_days_last.tail(10).mean()))) if len(prev_days_last) else 0
-            last15_prevday = int(prev_days_last.iloc[-1]) if len(prev_days_last) >= 1 else 0
-            last15_ratio_avg10 = (last15_today / last15_avg10) if last15_avg10 > 0 else float("inf")
-            last15_ratio_prevday = (last15_today / last15_prevday) if last15_prevday > 0 else float("inf")
-
-    return {
-        "ticker": sym,
-        "prev_bar_time_et": prev_bar_time.strftime("%Y-%m-%d %H:%M"),
-        "prev_bar_vol": prev_bar_vol,
-        "vol_26bars_ago": vol_26ago,
-        "ratio_prev_vs_26ago": None if ratio_26 is None or math.isinf(ratio_26) else round(ratio_26, 2),
-        "gt_2x_26": gt_2x_26,
-        "lt_0_5x_26": lt_0_5x_26,
-
-        "first15": {
-            "today": first15_today,
-            "avg10": first15_avg10,
-            "ratio_vs_avg10": None if math.isinf(first15_ratio_avg10) else round(first15_ratio_avg10, 2),
-            "prevday": first15_prevday,
-            "ratio_vs_prevday": None if math.isinf(first15_ratio_prevday) else round(first15_ratio_prevday, 2),
-        },
-
-        "last15": {
-            "has_today_close_bar": has_last_today,
-            "today": last15_today,
-            "avg10": last15_avg10,
-            "ratio_vs_avg10": None if (last15_ratio_avg10 is None or math.isinf(last15_ratio_avg10)) else round(last15_ratio_avg10, 2),
-            "prevday": last15_prevday,
-            "ratio_vs_prevday": None if (last15_ratio_prevday is None or math.isinf(last15_ratio_prevday)) else round(last15_ratio_prevday, 2),
-        },
-    }
-
-
-@app.post("/bar15_checks")
-def bar15_checks_endpoint(
+@app.post("/bar15_open_checks")
+def bar15_open_checks_endpoint(
     payload: Any = Body(...),
-    greater_multiple: float = 2.0,   # "greater than at least 100%" => >= 2.0x vs 26 bars ago
-    less_multiple: float = 0.5       # "less than at least 100%"   => <= 0.5x vs 26 bars ago
+    greater_multiple: float = 2.0,   # >= 2.0x vs 26 bars ago
+    less_multiple: float = 0.5       # <= 0.5x vs 26 bars ago
 ) -> Dict[str, Any]:
     """
-    Run on 15m RTH bars at 09:50 and 16:05 ET.
-    - Compare the most recent completed bar's volume vs the bar 26 bars ago (≈ same slot prior RTH day).
-    - First 15m and Last 15m comparisons:
-        * vs 10-day average
-        * vs previous day's same bar
-    Notes:
-      - 'last15' is populated only if the current session has a 15:45–16:00 closed bar.
-      - 'greater_multiple' and 'less_multiple' default to 2.0 and 0.5 (±100% thresholds).
+    Run at 09:50 ET. Returns:
+      - prev bar vs 26 bars ago ratio (+ threshold booleans)
+      - first 15m stats: today's vs 10-day avg and vs previous day
     """
     tickers = normalize(payload)
     if not tickers:
         raise HTTPException(status_code=400, detail="Empty tickers list.")
 
     results = []
-    hits = []  # tickers meeting either threshold vs 26 bars ago
+    hits = []
     for sym in tickers:
         try:
-            data = compute_15m_checks(sym)
+            df = rth_15m_df(sym, days=20)
+            meta = prev_vs_26(df)
 
-            # Apply the user-specified thresholds to the prev vs 26-ago ratio
-            ratio = data.get("ratio_prev_vs_26ago")
-            meets_gt = False
-            meets_lt = False
-            if ratio is not None:
-                meets_gt = ratio >= greater_multiple
-                meets_lt = ratio <= less_multiple
+            # thresholds
+            ratio = meta["ratio_prev_vs_26ago"]
+            meets_gt = (ratio is not None) and (ratio >= greater_multiple)
+            meets_lt = (ratio is not None) and (ratio <= less_multiple)
 
-            data["meets_gt_multiple_vs_26"] = meets_gt
-            data["meets_lt_multiple_vs_26"] = meets_lt
+            # first 15m (always available once first bar closes)
+            today_key = pd.Timestamp(meta["prev_bar_time_et"]).tz_localize(NY_TZ).date() \
+                if isinstance(meta["prev_bar_time_et"], pd.Timestamp) else df.index[-1].date()
+            first = first15_stats(df, today_key)
 
-            results.append(data)
+            out = {
+                "ticker": sym,
+                **meta,
+                "first15": first,
+                "meets_gt_multiple_vs_26": meets_gt,
+                "meets_lt_multiple_vs_26": meets_lt,
+            }
+            results.append(out)
             if meets_gt or meets_lt:
                 hits.append({"ticker": sym, "ratio_prev_vs_26ago": ratio, "gt": meets_gt, "lt": meets_lt})
+        except HTTPException as e:
+            results.append({"ticker": sym, "error": e.detail})
 
+    return {
+        "greater_multiple": greater_multiple,
+        "less_multiple": less_multiple,
+        "hits": hits,
+        "results": results
+    }
+
+
+@app.post("/bar15_close_checks")
+def bar15_close_checks_endpoint(
+    payload: Any = Body(...),
+    greater_multiple: float = 2.0,   # >= 2.0x vs 26 bars ago
+    less_multiple: float = 0.5       # <= 0.5x vs 26 bars ago
+) -> Dict[str, Any]:
+    """
+    Run at 16:05 ET. Returns:
+      - prev bar vs 26 bars ago ratio (+ threshold booleans)
+      - last 15m stats: today's (close bar) vs 10-day avg and vs previous day
+        (last15 appears only if today's 15:45–16:00 bar exists; on early-close days this remains None)
+    """
+    tickers = normalize(payload)
+    if not tickers:
+        raise HTTPException(status_code=400, detail="Empty tickers list.")
+
+    results = []
+    hits = []
+    for sym in tickers:
+        try:
+            df = rth_15m_df(sym, days=20)
+            meta = prev_vs_26(df)
+
+            # thresholds
+            ratio = meta["ratio_prev_vs_26ago"]
+            meets_gt = (ratio is not None) and (ratio >= greater_multiple)
+            meets_lt = (ratio is not None) and (ratio <= less_multiple)
+
+            today_key = df.index[-1].date()
+            last = last15_stats(df, today_key)
+
+            out = {
+                "ticker": sym,
+                **meta,
+                "last15": last,
+                "meets_gt_multiple_vs_26": meets_gt,
+                "meets_lt_multiple_vs_26": meets_lt,
+            }
+            results.append(out)
+            if meets_gt or meets_lt:
+                hits.append({"ticker": sym, "ratio_prev_vs_26ago": ratio, "gt": meets_gt, "lt": meets_lt})
         except HTTPException as e:
             results.append({"ticker": sym, "error": e.detail})
 
