@@ -196,7 +196,7 @@ def enrich_bear_endpoint(payload: Any = Body(...)) -> Dict[str, Any]:
     return {"results": results}
 
 
-# -------------------- NEW: /enrich_ext --------------------
+# -------------------- /enrich_ext --------------------
 
 def fetch_external(sym: str) -> Tuple[float | None, float | None]:
     """
@@ -463,7 +463,7 @@ def first15_spikes_endpoint(
     return {"multiple": multiple, "spikes": spikes, "results": results}
 
 
-# -------------------- NEW: Split 15m endpoints --------------------
+# -------------------- Split 15m endpoints --------------------
 
 @app.post("/bar15_open_checks")
 def bar15_open_checks_endpoint(
@@ -492,9 +492,8 @@ def bar15_open_checks_endpoint(
             meets_gt = (ratio is not None) and (ratio >= greater_multiple)
             meets_lt = (ratio is not None) and (ratio <= less_multiple)
 
-            # first 15m (always available once first bar closes)
-            today_key = pd.Timestamp(meta["prev_bar_time_et"]).tz_localize(NY_TZ).date() \
-                if isinstance(meta["prev_bar_time_et"], pd.Timestamp) else df.index[-1].date()
+            # first 15m (use today's session key from latest bar)
+            today_key = df.index[-1].date()
             first = first15_stats(df, today_key)
 
             out = {
@@ -568,3 +567,59 @@ def bar15_close_checks_endpoint(
         "hits": hits,
         "results": results
     }
+
+
+# -------------------- NEW: After-close daily volume spikes (default 5×) --------------------
+
+@app.post("/close_day_volume_spikes")
+def close_day_volume_spikes_endpoint(
+    payload: Any = Body(...),
+    multiple: float = 5.0
+) -> Dict[str, Any]:
+    """
+    After market close (e.g., 16:05 ET), flag tickers whose **today's daily volume**
+    is >= `multiple` × **previous trading day's** volume.
+
+    Query param:
+      - multiple (float): default 5.0 for 5×.
+
+    Body:
+      { "tickers": ["AAPL","MSFT", ...] }
+
+    Output:
+      {
+        "multiple": 5.0,
+        "spikes": [ ...only tickers meeting/exceeding threshold... ],
+        "results": [ ...all tickers with volumes/ratio... ]
+      }
+    """
+    tickers = normalize(payload)
+    if not tickers:
+        raise HTTPException(status_code=400, detail="Empty tickers list.")
+
+    spikes = []
+    results = []
+    for sym in tickers:
+        try:
+            df_d = fetch(sym, period="2mo", interval="1d")
+            if len(df_d) < 2:
+                raise HTTPException(status_code=502, detail=f"Not enough daily data for {sym}")
+
+            vol_today = int(df_d["Volume"].iloc[-1])
+            vol_prev = int(df_d["Volume"].iloc[-2])
+            ratio = (vol_today / vol_prev) if vol_prev > 0 else float("inf")
+
+            item = {
+                "ticker": sym,
+                "vol_today": vol_today,
+                "vol_prevday": vol_prev,
+                "ratio": None if math.isinf(ratio) else round(ratio, 2),
+                "meets_threshold": (ratio >= multiple) if not math.isinf(ratio) else (vol_prev == 0 and vol_today > 0),
+            }
+            results.append(item)
+            if item["meets_threshold"]:
+                spikes.append(item)
+        except HTTPException as e:
+            results.append({"ticker": sym, "error": e.detail})
+
+    return {"multiple": multiple, "spikes": spikes, "results": results}
