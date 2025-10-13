@@ -7,6 +7,11 @@ import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI, Body, HTTPException
 
+# --- NEW: imports for the first-15m endpoint ---
+from datetime import time as dtime
+import pytz
+# ----------------------------------------------
+
 app = FastAPI(title="RS5/RS10 API")
 
 SPX = "^GSPC"  # S&P 500 index on Yahoo
@@ -16,6 +21,10 @@ WINDOWS = [5, 10]  # RS5, RS10
 FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN", "")
 _ext_cache: dict[str, Tuple[float, Tuple[float | None, float | None]]] = {}
 EXT_TTL = 60 * 30  # 30 minutes cache
+
+# --- NEW: timezone for RTH filtering in first-15m endpoint ---
+NY_TZ = pytz.timezone("America/New_York")
+# ------------------------------------------------------------
 
 
 def fetch(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
@@ -302,3 +311,69 @@ def enrich_ext_endpoint(payload: Any = Body(...)) -> Dict[str, Any]:
             results.append({"ticker": sym, "error": e.detail})
 
     return {"results": results}
+
+
+# -------------------- NEW: first 15-minute volume spikes --------------------
+
+def first_15m_volumes(sym: str) -> Tuple[int, int, float]:
+    """
+    Returns (vol_today, vol_avg10, ratio).
+    Uses 15m bars, RTH only (09:30–16:00 ET), first bar per session.
+    """
+    df = fetch(sym, period="11d", interval="15m")
+    if df.empty:
+        raise HTTPException(status_code=502, detail=f"No intraday data for {sym}")
+
+    # ensure tz-aware -> NY time, then restrict to cash session
+    if df.index.tz is None:
+        df = df.tz_localize("UTC")
+    df = df.tz_convert(NY_TZ)
+    df_rth = df.between_time(dtime(9, 30), dtime(16, 0))
+
+    # first 15m bar per RTH session
+    df_rth = df_rth.copy()
+    df_rth["session"] = df_rth.index.date
+    daily_first = df_rth.groupby("session")["Volume"].first()
+    if len(daily_first) < 2:
+        raise HTTPException(status_code=502, detail=f"Not enough RTH sessions for {sym}")
+
+    vol_today = int(daily_first.iloc[-1])
+    prior = daily_first.iloc[:-1].tail(10)  # up to last 10 sessions
+    vol_avg10 = int(round(float(prior.mean()))) if len(prior) > 0 else 0
+    ratio = (vol_today / vol_avg10) if vol_avg10 > 0 else float("inf")
+    return vol_today, vol_avg10, ratio
+
+
+@app.post("/first15_spikes")
+def first15_spikes_endpoint(
+    payload: Any = Body(...),
+    multiple: float = 2.0   # X times the 10-day avg (e.g., 2.0 = 200%)
+) -> Dict[str, Any]:
+    """
+    Screen for tickers where today's first 15m volume >= multiple * avg(first 15m volume of last 10 sessions).
+    Request body: {"tickers": ["AAPL","MSFT",...]}  (same normalize() as your other endpoints)
+    Optional query param: ?multiple=2.5
+    """
+    tickers = normalize(payload)
+    if not tickers:
+        raise HTTPException(status_code=400, detail="Empty tickers list.")
+
+    results = []
+    spikes = []  # tickers that meet/exceed the multiple
+    for sym in tickers:
+        try:
+            vol_today, vol_avg10, ratio = first_15m_volumes(sym)
+            item = {
+                "ticker": sym,
+                "vol_15m_today": vol_today,
+                "vol_15m_avg10": vol_avg10,
+                "ratio": None if math.isinf(ratio) else round(ratio, 2),
+                "meets_threshold": (ratio >= multiple) if not math.isinf(ratio) else (vol_avg10 == 0 and vol_today > 0)
+            }
+            results.append(item)
+            if item["meets_threshold"]:
+                spikes.append(item)
+        except HTTPException as e:
+            results.append({"ticker": sym, "error": e.detail})
+
+    return {"multiple": multiple, "spikes": spikes, "results": results}
