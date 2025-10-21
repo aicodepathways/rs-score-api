@@ -840,42 +840,132 @@ def analyze_consolidation_break(
         "broke_down_today": broke_down,
     }
 
+# -------------------- Market direction helper (optional inversion check) --------------------
+def market_direction(sym: str, lookback: int = 21, min_trend_pct: float = 0.5) -> Dict[str, Any]:
+    """
+    Computes the benchmark's direction over `lookback` completed daily bars.
+    Returns 'up' if pct_change >= min_trend_pct,
+            'down' if pct_change <= -min_trend_pct,
+            'flat' otherwise.
+    """
+    df = fetch(sym, period="6mo", interval="1d")
+    df = _select_completed_daily(df, include_incomplete=False)
+    if len(df) < lookback:
+        raise HTTPException(status_code=502, detail=f"Not enough daily data for benchmark {sym}")
+    win = df.tail(lookback)
+    first_close = float(win["Close"].iloc[0])
+    last_close = float(win["Close"].iloc[-1])
+    if first_close <= 0:
+        raise HTTPException(status_code=502, detail=f"Invalid benchmark close for {sym}")
+    pct_change = round((last_close - first_close) / first_close * 100.0, 2)
+    if pct_change >= min_trend_pct:
+        direction = "up"
+    elif pct_change <= -min_trend_pct:
+        direction = "down"
+    else:
+        direction = "flat"
+    return {"benchmark": sym, "lookback": lookback, "pct_change": pct_change, "direction": direction}
+
+
 @app.post("/daily_consolidation_breaks")
 def daily_consolidation_breaks_endpoint(
     payload: Any = Body(...),
+    # consolidation params (same defaults)
     lookback: int = 21,
     max_range_pct: float = 4.0,
     min_days: int = 15,
-    include_incomplete: bool = False
+    include_incomplete: bool = False,
+    # OPTIONAL market inversion params (leave benchmark="" to disable)
+    benchmark: str = "",            # e.g. "QQQ" or "^NDX"; empty string disables inversion check
+    market_lookback: int = 21,
+    min_trend_pct: float = 0.5,
+    require_membership: bool = False   # if True, only flag inversion when ticker in provided list
 ) -> Dict[str, Any]:
     """
     Detects consolidation on daily candles and signals when highs/lows get taken out.
-    Default = 21-day consolidation window (1 trading month).
+    Also (optionally) flags if the break is *inversing the market* relative to a benchmark.
+
+    Inversion rules (only when `benchmark` is provided):
+      - If market direction == 'up' AND stock breaks *down* -> inversing
+      - If market direction == 'down' AND stock breaks *up* -> inversing
+
+    Membership filter (optional):
+      - If require_membership=true, pass 'ndx_members' or 'universe' list in the body.
     """
     tickers = normalize(payload)
     if not tickers:
         raise HTTPException(status_code=400, detail="Empty tickers list.")
+
+    # Optional membership/universe provided by caller (e.g., NDX/QQQ constituents)
+    members = set()
+    if isinstance(payload, dict):
+        if isinstance(payload.get("ndx_members"), list):
+            members = {str(x).upper() for x in payload["ndx_members"]}
+        elif isinstance(payload.get("universe"), list):
+            members = {str(x).upper() for x in payload["universe"]}
+
+    # Compute market direction once if benchmark is provided
+    bench = None
+    if isinstance(benchmark, str) and benchmark.strip():
+        bench = market_direction(sym=benchmark.strip(), lookback=market_lookback, min_trend_pct=min_trend_pct)
 
     results = []
     hits = []
 
     for sym in tickers:
         try:
-            out = analyze_consolidation_break(
+            base = analyze_consolidation_break(
                 sym,
                 lookback=lookback,
                 max_range_pct=max_range_pct,
                 min_days=min_days,
                 include_incomplete=include_incomplete
             )
-            results.append(out)
-            if out["status"] in ("break_up", "break_down", "both_taken_out"):
+
+            # Defaults (no inversion check)
+            inversing_market = None
+            inverse_reason = None
+            is_member = True  # default allow unless require_membership gates it
+
+            if bench is not None:
+                # Apply membership gate if requested
+                is_member = (not require_membership) or (sym.upper() in members)
+
+                direction = bench["direction"]
+                # Only count a break if the status indicates an actual break today
+                broke_up = base["broke_up_today"] and base["status"] in ("break_up", "both_taken_out")
+                broke_down = base["broke_down_today"] and base["status"] in ("break_down", "both_taken_out")
+
+                if is_member:
+                    if direction == "up" and broke_down:
+                        inversing_market = True
+                        inverse_reason = "market_up_stock_breaks_down"
+                    elif direction == "down" and broke_up:
+                        inversing_market = True
+                        inverse_reason = "market_down_stock_breaks_up"
+                    else:
+                        inversing_market = False  # checked but not inversing
+
+            row = {
+                "ticker": sym,
+                **base,
+                "benchmark": bench if bench is not None else None,
+                "require_membership": require_membership if bench is not None else None,
+                "is_member": is_member if bench is not None else None,
+                "inversing_market": inversing_market,  # None = not evaluated; True/False = evaluated
+                "inverse_reason": inverse_reason,
+            }
+            results.append(row)
+
+            if bench is not None and inversing_market:
                 hits.append({
                     "ticker": sym,
-                    "status": out["status"],
-                    "consolidation_high": out["consolidation_high"],
-                    "consolidation_low": out["consolidation_low"],
+                    "status": base["status"],
+                    "inverse_reason": inverse_reason,
+                    "consolidation_high": base["consolidation_high"],
+                    "consolidation_low": base["consolidation_low"],
                 })
+
         except HTTPException as e:
             results.append({"ticker": sym, "error": e.detail})
 
@@ -884,9 +974,12 @@ def daily_consolidation_breaks_endpoint(
             "lookback": lookback,
             "min_days": min_days,
             "max_range_pct": max_range_pct,
-            "include_incomplete": include_incomplete
+            "include_incomplete": include_incomplete,
+            "benchmark": (benchmark if bench is not None else ""),
+            "market_lookback": (market_lookback if bench is not None else None),
+            "min_trend_pct": (min_trend_pct if bench is not None else None),
+            "require_membership": (require_membership if bench is not None else None),
         },
         "hits": hits,
         "results": results
     }
-
