@@ -12,6 +12,10 @@ from datetime import time as dtime
 import pytz
 # -----------------------------------------------------------
 
+# --- NEW: import for after-hours timestamping ---
+from datetime import datetime
+# ------------------------------------------------
+
 app = FastAPI(title="RS5/RS10 API")
 
 SPX = "^GSPC"  # S&P 500 index on Yahoo
@@ -623,3 +627,127 @@ def close_day_volume_spikes_endpoint(
             results.append({"ticker": sym, "error": e.detail})
 
     return {"multiple": multiple, "spikes": spikes, "results": results}
+
+
+# -------------------- NEW: After-hours price move vs regular close --------------------
+
+def afterhours_move(sym: str, threshold: float = 1.5) -> Dict[str, Any]:
+    """
+    Compare latest *after-hours* price (post RTH close, up to 20:00 ET) to today's regular-session close.
+    Returns dict with after-hours price, close, pct change, and threshold flag.
+    """
+    # --- today's official close from daily bars ---
+    df_daily = fetch(sym, period="1mo", interval="1d")
+    if len(df_daily) < 1:
+        raise HTTPException(status_code=502, detail=f"Not enough daily data for {sym}")
+
+    close_today = float(df_daily["Close"].iloc[-1])
+    # trading day (naive date) corresponding to last daily row
+    session_date = df_daily.index[-1].date()
+
+    # --- find the RTH close timestamp for that session using intraday bars ---
+    # Use 15m to determine the latest RTH bar time (handles early closes gracefully)
+    df_15 = fetch(sym, period="5d", interval="15m")
+    if df_15.index.tz is None:
+        df_15 = df_15.tz_localize("UTC")
+    df_15 = df_15.tz_convert(NY_TZ)
+
+    # limit to that session_date
+    df_15["session"] = df_15.index.date
+    df_sess_15 = df_15.loc[df_15["session"] == session_date]
+    if df_sess_15.empty:
+        raise HTTPException(status_code=502, detail=f"No intraday session data for {sym} on {session_date}")
+
+    # RTH window (approx) — take max timestamp <= 16:00 ET if present, else last timestamp of session
+    rth_end_candidate = df_sess_15.index[df_sess_15.index.time <= dtime(16, 0)]
+    close_ts = rth_end_candidate.max() if len(rth_end_candidate) else df_sess_15.index.max()
+
+    # --- get latest after-hours price up to now (cap at 20:00 ET) ---
+    df_5 = fetch(sym, period="5d", interval="5m")
+    if df_5.index.tz is None:
+        df_5 = df_5.tz_localize("UTC")
+    df_5 = df_5.tz_convert(NY_TZ)
+    df_5["session"] = df_5.index.date
+
+    now_et = datetime.now(NY_TZ)
+    window_end_time = min(now_et.time(), dtime(20, 0))
+
+    # after-hours rows: strictly after close_ts and same session_date, up to 20:00 ET (or now, whichever is earlier)
+    mask = (
+        (df_5["session"] == session_date) &
+        (df_5.index > close_ts) &
+        (df_5.index.time <= window_end_time)
+    )
+    df_ah = df_5.loc[mask]
+    if df_ah.empty:
+        # No after-hours bars yet — report gracefully
+        return {
+            "after_hours_available": False,
+            "asof_et": None,
+            "after_hours_price": None,
+            "regular_close": close_today,
+            "pct_change": None,
+            "abs_change": None,
+            "threshold": threshold,
+            "meets_threshold": False
+        }
+
+    last_row = df_ah.iloc[-1]
+    last_ts = df_ah.index[-1]
+    last_px = float(last_row["Close"])
+
+    pct_change = round((last_px - close_today) / close_today * 100.0, 2)
+    abs_change = abs(pct_change)
+    meets = abs_change >= threshold
+
+    return {
+        "after_hours_available": True,
+        "asof_et": last_ts.strftime("%Y-%m-%d %H:%M"),
+        "after_hours_price": last_px,
+        "regular_close": close_today,
+        "pct_change": pct_change,
+        "abs_change": abs_change,
+        "threshold": threshold,
+        "meets_threshold": meets
+    }
+
+
+@app.post("/afterhours_price_checks")
+def afterhours_price_checks_endpoint(
+    payload: Any = Body(...),
+    threshold: float = 1.5  # absolute % move vs regular close
+) -> Dict[str, Any]:
+    """
+    Call at 18:05 ET and 20:05 ET.
+    Flags tickers whose *after-hours* price has moved by >= `threshold` percent
+    relative to today's regular-session close.
+
+    Body: {"tickers": ["AAPL","MSFT", ...]}
+    Query param: ?threshold=1.5  (absolute percent)
+    """
+    tickers = normalize(payload)
+    if not tickers:
+        raise HTTPException(status_code=400, detail="Empty tickers list.")
+
+    results = []
+    hits = []
+    for sym in tickers:
+        try:
+            out = afterhours_move(sym, threshold=threshold)
+            row = {"ticker": sym, **out}
+            results.append(row)
+            if out.get("after_hours_available") and out.get("meets_threshold"):
+                hits.append({
+                    "ticker": sym,
+                    "asof_et": out.get("asof_et"),
+                    "pct_change": out.get("pct_change"),
+                    "abs_change": out.get("abs_change"),
+                })
+        except HTTPException as e:
+            results.append({"ticker": sym, "error": e.detail})
+
+    return {
+        "threshold": threshold,
+        "hits": hits,
+        "results": results
+    }
