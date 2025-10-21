@@ -751,3 +751,142 @@ def afterhours_price_checks_endpoint(
         "hits": hits,
         "results": results
     }
+
+# -------------------- Daily consolidation + breakout/breakdown --------------------
+
+def _select_completed_daily(df_d: pd.DataFrame, include_incomplete: bool) -> pd.DataFrame:
+    """
+    Returns a daily DataFrame where the last row is a completed session bar, unless
+    include_incomplete=True (in which case it may include today's partial bar).
+    """
+    if df_d.empty:
+        return df_d
+    now_et = datetime.now(NY_TZ)
+    market_close = dtime(16, 0)
+    last_date = df_d.index[-1].date()
+    # If we’re on today's bar and before market close, drop it (unless include_incomplete=true)
+    if (not include_incomplete) and (now_et.date() == last_date) and (now_et.time() < market_close):
+        if len(df_d) >= 2:
+            return df_d.iloc[:-1]
+    return df_d
+
+
+def analyze_consolidation_break(
+    sym: str,
+    lookback: int = 21,
+    max_range_pct: float = 4.0,
+    min_days: int = 15,
+    include_incomplete: bool = False
+) -> Dict[str, Any]:
+    """
+    Detects consolidation over the previous `lookback` daily bars (excluding latest bar),
+    then checks if the latest bar takes out the consolidation HIGH or LOW (wick-based).
+    """
+    if lookback < max(min_days, 2):
+        raise HTTPException(status_code=400, detail="lookback must be >= max(min_days, 2)")
+
+    df_d = fetch(sym, period="6mo", interval="1d")
+    if len(df_d) < (min_days + 1):
+        raise HTTPException(status_code=502, detail=f"Not enough daily data for {sym}")
+
+    df_d = _select_completed_daily(df_d, include_incomplete=include_incomplete)
+    if len(df_d) < (min_days + 1):
+        raise HTTPException(status_code=502, detail=f"Not enough completed daily bars for {sym}")
+
+    window = df_d.tail(lookback + 1)
+    cons_df = window.iloc[:-1]  # consolidation range
+    latest = window.iloc[-1]    # latest bar = breakout test
+
+    cons_high = float(cons_df["High"].max())
+    cons_low = float(cons_df["Low"].min())
+    ref_close = float(cons_df["Close"].iloc[-1])
+    range_pct = round(((cons_high - cons_low) / ref_close) * 100.0, 2) if ref_close > 0 else None
+
+    is_consolidating = (len(cons_df) >= min_days) and (range_pct is not None) and (range_pct <= max_range_pct)
+
+    latest_high = float(latest["High"])
+    latest_low = float(latest["Low"])
+    latest_date = window.index[-1].strftime("%Y-%m-%d")
+
+    broke_up = is_consolidating and (latest_high > cons_high)
+    broke_down = is_consolidating and (latest_low < cons_low)
+
+    status = "no_consolidation"
+    if is_consolidating:
+        if broke_up and not broke_down:
+            status = "break_up"
+        elif broke_down and not broke_up:
+            status = "break_down"
+        elif broke_down and broke_up:
+            status = "both_taken_out"
+        else:
+            status = "consolidating"
+
+    return {
+        "ticker": sym,
+        "latest_session": latest_date,
+        "lookback": lookback,
+        "min_days": min_days,
+        "max_range_pct": max_range_pct,
+        "include_incomplete": include_incomplete,
+        "is_consolidating": is_consolidating,
+        "status": status,
+        "consolidation_high": round(cons_high, 4),
+        "consolidation_low": round(cons_low, 4),
+        "consolidation_range_pct": range_pct,
+        "latest_high": round(latest_high, 4),
+        "latest_low": round(latest_low, 4),
+        "broke_up_today": broke_up,
+        "broke_down_today": broke_down,
+    }
+
+@app.post("/daily_consolidation_breaks")
+def daily_consolidation_breaks_endpoint(
+    payload: Any = Body(...),
+    lookback: int = 21,
+    max_range_pct: float = 4.0,
+    min_days: int = 15,
+    include_incomplete: bool = False
+) -> Dict[str, Any]:
+    """
+    Detects consolidation on daily candles and signals when highs/lows get taken out.
+    Default = 21-day consolidation window (1 trading month).
+    """
+    tickers = normalize(payload)
+    if not tickers:
+        raise HTTPException(status_code=400, detail="Empty tickers list.")
+
+    results = []
+    hits = []
+
+    for sym in tickers:
+        try:
+            out = analyze_consolidation_break(
+                sym,
+                lookback=lookback,
+                max_range_pct=max_range_pct,
+                min_days=min_days,
+                include_incomplete=include_incomplete
+            )
+            results.append(out)
+            if out["status"] in ("break_up", "break_down", "both_taken_out"):
+                hits.append({
+                    "ticker": sym,
+                    "status": out["status"],
+                    "consolidation_high": out["consolidation_high"],
+                    "consolidation_low": out["consolidation_low"],
+                })
+        except HTTPException as e:
+            results.append({"ticker": sym, "error": e.detail})
+
+    return {
+        "params": {
+            "lookback": lookback,
+            "min_days": min_days,
+            "max_range_pct": max_range_pct,
+            "include_incomplete": include_incomplete
+        },
+        "hits": hits,
+        "results": results
+    }
+
