@@ -7,14 +7,14 @@ import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI, Body, HTTPException
 
+# --- NEW: imports for insider helpers & time handling ---
+from datetime import datetime, timedelta
+# -------------------------------------------------------
+
 # --- NEW: imports for the first-15m/15m checks endpoints ---
 from datetime import time as dtime
 import pytz
 # -----------------------------------------------------------
-
-# --- NEW: import for after-hours timestamping ---
-from datetime import datetime
-# ------------------------------------------------
 
 app = FastAPI(title="RS5/RS10 API")
 
@@ -26,10 +26,112 @@ FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN", "")
 _ext_cache: dict[str, Tuple[float, Tuple[float | None, float | None]]] = {}
 EXT_TTL = 60 * 30  # 30 minutes cache
 
-# --- Timezone for RTH filtering ---
+# --- Timezone for RTH filtering (define early so helpers can use it) ---
 NY_TZ = pytz.timezone("America/New_York")
-# ----------------------------------
+# ----------------------------------------------------------------------
 
+# ---- Insider (Finnhub) helpers & cache ----
+INSIDER_TTL = 60 * 15  # 15 minutes
+_insider_cache: dict[str, Tuple[float, Any]] = {}
+
+def _finnhub_get(path: str, params: dict) -> Any:
+    if not FINNHUB_TOKEN:
+        raise HTTPException(status_code=500, detail="FINNHUB_TOKEN not set")
+    try:
+        r = requests.get(
+            f"https://finnhub.io/api/v1/{path}",
+            params={**params, "token": FINNHUB_TOKEN},
+            timeout=12,
+        )
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Finnhub error: {e}")
+
+def _cache_get(key: str):
+    now = time.time()
+    if key in _insider_cache and now - _insider_cache[key][0] < INSIDER_TTL:
+        return _insider_cache[key][1]
+    return None
+
+def _cache_set(key: str, value: Any):
+    _insider_cache[key] = (time.time(), value)
+
+def fetch_insider_transactions(sym: str, days: int = 90) -> List[dict]:
+    """
+    Finnhub: /stock/insider-transactions
+    Returns list of dicts (raw), limited to last `days`.
+    """
+    to_dt = datetime.now(NY_TZ).date()
+    from_dt = to_dt - timedelta(days=days)
+    cache_key = f"ins_txn:{sym}:{from_dt}:{to_dt}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    data = _finnhub_get(
+        "stock/insider-transactions",
+        {"symbol": sym, "from": str(from_dt), "to": str(to_dt)},
+    )
+    rows = data.get("data") or []
+    _cache_set(cache_key, rows)
+    return rows
+
+def summarize_insider(rows: List[dict]) -> Dict[str, Any]:
+    """
+    Aggregate buys/sells, net shares & notional (if price present),
+    recentness, and cluster (unique buyers).
+    """
+    buys_shares = 0
+    sells_shares = 0
+    buys_notional = 0.0
+    sells_notional = 0.0
+    buyers = set()
+    sellers = set()
+    most_recent = None
+
+    for r in rows:
+        code = str(r.get("transactionCode") or r.get("type") or "").upper()  # 'P' purchase / 'S' sale
+        shares = float(r.get("change") or r.get("share") or r.get("shares") or 0)
+        px = float(r.get("transactionPrice") or r.get("price") or 0.0)
+        who = (r.get("name") or r.get("insiderName") or "").strip()
+
+        dstr = r.get("transactionDate") or r.get("filingDate")
+        if dstr:
+            try:
+                d = datetime.fromisoformat(dstr[:10])
+                most_recent = d if (most_recent is None or d > most_recent) else most_recent
+            except ValueError:
+                pass
+
+        if code == "P":
+            buys_shares += max(shares, 0)
+            if px > 0 and shares > 0:
+                buys_notional += px * shares
+            if who:
+                buyers.add(who)
+        elif code == "S":
+            sells_shares += max(shares, 0)
+            if px > 0 and shares > 0:
+                sells_notional += px * shares
+            if who:
+                sellers.add(who)
+
+    net_shares = buys_shares - sells_shares
+    net_notional = round(buys_notional - sells_notional, 2)
+
+    return {
+        "total_buys_shares": int(buys_shares),
+        "total_sells_shares": int(sells_shares),
+        "net_shares": int(net_shares),
+        "buy_notional": round(buys_notional, 2),
+        "sell_notional": round(sells_notional, 2),
+        "net_notional": net_notional,
+        "unique_buyers": len(buyers),
+        "unique_sellers": len(sellers),
+        "most_recent_txn": most_recent.strftime("%Y-%m-%d") if most_recent else None,
+    }
+# ----------------------------------------------------------
 
 def fetch(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
@@ -314,6 +416,132 @@ def enrich_ext_endpoint(payload: Any = Body(...)) -> Dict[str, Any]:
         except HTTPException as e:
             results.append({"ticker": sym, "error": e.detail})
 
+    return {"results": results}
+
+
+# -------------------- Insider endpoints --------------------
+
+@app.post("/insider_summary")
+def insider_summary_endpoint(
+    payload: Any = Body(...),
+    days: int = 90
+) -> Dict[str, Any]:
+    """
+    For each ticker: returns aggregate insider activity over the last `days`.
+    Body: {"tickers": ["AAPL","MSFT", ...]}
+    """
+    tickers = normalize(payload)
+    if not tickers:
+        raise HTTPException(status_code=400, detail="Empty tickers list.")
+
+    results = []
+    for sym in tickers:
+        try:
+            rows = fetch_insider_transactions(sym, days=days)
+            summary = summarize_insider(rows)
+            results.append({"ticker": sym, "days": days, **summary})
+        except HTTPException as e:
+            results.append({"ticker": sym, "error": e.detail})
+    return {"days": days, "results": results}
+
+@app.post("/insider_cluster_buys")
+def insider_cluster_buys_endpoint(
+    payload: Any = Body(...),
+    days: int = 60,
+    min_unique_buyers: int = 3,
+    min_net_shares: int = 10000,
+    min_net_notional: float = 250000.0
+) -> Dict[str, Any]:
+    """
+    Flags tickers with 'cluster buys' in the last `days`.
+    Criteria are configurable via query params.
+    """
+    tickers = normalize(payload)
+    if not tickers:
+        raise HTTPException(status_code=400, detail="Empty tickers list.")
+
+    results = []
+    hits = []
+    for sym in tickers:
+        try:
+            rows = fetch_insider_transactions(sym, days=days)
+            s = summarize_insider(rows)
+
+            meets = (
+                (s["unique_buyers"] >= min_unique_buyers) and
+                (s["net_shares"] >= min_net_shares) and
+                (s["net_notional"] >= min_net_notional)
+            )
+
+            item = {"ticker": sym, "days": days, **s, "meets_threshold": meets}
+            results.append(item)
+            if meets:
+                hits.append(item)
+        except HTTPException as e:
+            results.append({"ticker": sym, "error": e.detail})
+
+    return {
+        "params": {
+            "days": days,
+            "min_unique_buyers": min_unique_buyers,
+            "min_net_shares": min_net_shares,
+            "min_net_notional": min_net_notional
+        },
+        "hits": hits,
+        "results": results
+    }
+
+def fetch_insider_sentiment(sym: str) -> Dict[str, Any]:
+    cache_key = f"ins_sent:{sym}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    data = _finnhub_get("stock/insider-sentiment", {"symbol": sym})
+    latest = (data.get("data") or [])[-1] if (data.get("data")) else None
+    out = {"latest_month": latest}
+    _cache_set(cache_key, out)
+    return out
+
+@app.post("/insider_score")
+def insider_score_endpoint(
+    payload: Any = Body(...),
+    days: int = 90,
+    w_cluster: float = 0.5,
+    w_net_notional: float = 0.3,
+    w_sentiment: float = 0.2
+) -> Dict[str, Any]:
+    """
+    Heuristic 0–100 score combining cluster size, net notional, and Finnhub sentiment (mspr).
+    """
+    tickers = normalize(payload)
+    if not tickers:
+        raise HTTPException(status_code=400, detail="Empty tickers list.")
+
+    results = []
+    for sym in tickers:
+        try:
+            rows = fetch_insider_transactions(sym, days=days)
+            s = summarize_insider(rows)
+            sent = fetch_insider_sentiment(sym).get("latest_month") or {}
+
+            cluster = min(s["unique_buyers"], 8) / 8.0
+            net_notional = max(min(s["net_notional"] / 2_000_000.0, 1.0), 0.0)
+            mspr = float(sent.get("mspr") or 0.0)
+            mspr_norm = (max(min(mspr, 100.0), -100.0) + 100.0) / 200.0
+
+            score01 = (w_cluster * cluster) + (w_net_notional * net_notional) + (w_sentiment * mspr_norm)
+            score = round(score01 * 100.0, 1)
+
+            results.append({
+                "ticker": sym,
+                "days": days,
+                "unique_buyers": s["unique_buyers"],
+                "net_notional": s["net_notional"],
+                "mspr": sent.get("mspr"),
+                "score": score
+            })
+        except HTTPException as e:
+            results.append({"ticker": sym, "error": e.detail})
     return {"results": results}
 
 
