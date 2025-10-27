@@ -80,20 +80,34 @@ def fetch_insider_transactions(sym: str, days: int = 90) -> List[dict]:
 def summarize_insider(rows: List[dict]) -> Dict[str, Any]:
     """
     Aggregate buys/sells, net shares & notional (if price present),
-    recentness, and cluster (unique buyers).
+    recentness, and cluster (unique buyers/sellers).
     """
-    buys_shares = 0
-    sells_shares = 0
+    buys_shares = 0.0
+    sells_shares = 0.0
     buys_notional = 0.0
     sells_notional = 0.0
-    buyers = set()
-    sellers = set()
+    buyers, sellers = set(), set()
     most_recent = None
 
     for r in rows:
-        code = str(r.get("transactionCode") or r.get("type") or "").upper()  # 'P' purchase / 'S' sale
-        shares = float(r.get("change") or r.get("share") or r.get("shares") or 0)
-        px = float(r.get("transactionPrice") or r.get("price") or 0.0)
+        code = str(r.get("transactionCode") or r.get("type") or "").upper().strip()  # 'P' buy / 'S' sell / others ignored
+        # Shares can appear under several keys; prefer Finnhub's 'transactionShares'
+        shares_raw = (
+            r.get("transactionShares", None)
+            if r.get("transactionShares", None) not in (None, "")
+            else (r.get("change", None) if r.get("change", None) not in (None, "") else (r.get("share", None) if r.get("share", None) not in (None, "") else r.get("shares", 0)))
+        )
+        try:
+            shares = float(shares_raw or 0)
+        except (TypeError, ValueError):
+            shares = 0.0
+
+        px_raw = r.get("transactionPrice", None) or r.get("price", None) or 0
+        try:
+            px = float(px_raw or 0)
+        except (TypeError, ValueError):
+            px = 0.0
+
         who = (r.get("name") or r.get("insiderName") or "").strip()
 
         dstr = r.get("transactionDate") or r.get("filingDate")
@@ -105,15 +119,20 @@ def summarize_insider(rows: List[dict]) -> Dict[str, Any]:
                 pass
 
         if code == "P":
-            buys_shares += max(shares, 0)
-            if px > 0 and shares > 0:
-                buys_notional += px * shares
+            # Some feeds may send negative 'change' for buys—normalize to absolute size
+            sh = abs(shares)
+            buys_shares += sh
+            if px > 0 and sh > 0:
+                buys_notional += px * sh
             if who:
                 buyers.add(who)
+
         elif code == "S":
-            sells_shares += max(shares, 0)
-            if px > 0 and shares > 0:
-                sells_notional += px * shares
+            # Many Finnhub rows have negative 'change' for sales—count absolute shares
+            sh = abs(shares)
+            sells_shares += sh
+            if px > 0 and sh > 0:
+                sells_notional += px * sh
             if who:
                 sellers.add(who)
 
@@ -121,9 +140,9 @@ def summarize_insider(rows: List[dict]) -> Dict[str, Any]:
     net_notional = round(buys_notional - sells_notional, 2)
 
     return {
-        "total_buys_shares": int(buys_shares),
-        "total_sells_shares": int(sells_shares),
-        "net_shares": int(net_shares),
+        "total_buys_shares": int(round(buys_shares)),
+        "total_sells_shares": int(round(sells_shares)),
+        "net_shares": int(round(net_shares)),
         "buy_notional": round(buys_notional, 2),
         "sell_notional": round(sells_notional, 2),
         "net_notional": net_notional,
@@ -131,7 +150,7 @@ def summarize_insider(rows: List[dict]) -> Dict[str, Any]:
         "unique_sellers": len(sellers),
         "most_recent_txn": most_recent.strftime("%Y-%m-%d") if most_recent else None,
     }
-# ----------------------------------------------------------
+
 
 def fetch(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
